@@ -1,0 +1,3 @@
+# Les fichiers texte sont stockés avec des fins de ligne Unix (LF) dans le dépôt ;
+# chaque poste les extrait au format de son système (CRLF sous Windows).
+* text=auto
