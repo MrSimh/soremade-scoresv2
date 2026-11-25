@@ -1,15 +1,15 @@
 import sys
 # pyarrow plante sur le processeur du serveur (Intel Atom N2800, sans SSE4.2).
 # On l'empêche d'être chargé : sans cette ligne, pandas l'importe tout seul.
-# Le graphique et la page Données n'en ont plus besoin (voir points_chart, html_table).
+# Le graphique et la page Données n'en ont plus besoin (voir points_chart, table_editor).
 sys.modules.setdefault("pyarrow", None)
 
-import io
+import hashlib
+import json
 import streamlit as st
 import pandas as pd
 import os
 from urllib.parse import quote
-from html import escape as html_escape
 
 # --- 1. CONFIGURATION ET CSS ---
 st.set_page_config(page_title="Soremade Tracker", layout="wide", initial_sidebar_state="expanded")
@@ -123,23 +123,129 @@ def points_chart(values, color="#cc0000", width=700, height=260):
     parts.append("</svg>")
     return "".join(parts)
 
-def html_table(df):
-    """Tableau HTML en lecture seule (remplace st.dataframe / st.data_editor)."""
-    def cell(v):
-        if pd.isna(v):
-            return ""
-        if isinstance(v, float) and v.is_integer():
-            v = int(v)
-        return html_escape(str(v))
-    head = "".join(f"<th>{html_escape(str(c))}</th>" for c in df.columns)
-    rows = "".join("<tr>" + "".join(f"<td>{cell(v)}</td>" for v in row) + "</tr>"
-                   for row in df.itertuples(index=False))
-    return (
-        '<div style="max-height:450px;overflow:auto;border:1px solid #333">'
-        '<table style="width:100%;border-collapse:collapse;font-size:14px">'
-        f'<thead style="position:sticky;top:0;background:#1a1a1a"><tr>{head}</tr></thead>'
-        f"<tbody>{rows}</tbody></table></div>"
+# Tableau éditable (remplace st.data_editor). Composant Streamlit v2 en HTML/JS :
+# les données circulent en JSON (listes), jamais en DataFrame, donc sans pyarrow.
+_TABLE_EDITOR_CSS = """
+.ed-wrap { max-height: 500px; overflow: auto; border: 1px solid #333; }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th { position: sticky; top: 0; z-index: 1; background: #1a1a1a; color: #d1d1d1;
+     text-align: left; padding: 6px 8px; border-bottom: 1px solid #444; font-weight: 600;
+     overflow-wrap: anywhere; }
+td { border-bottom: 1px solid #2a2a2a; padding: 0; }
+td input { width: 100%; box-sizing: border-box; background: transparent; border: 1px solid transparent;
+           color: var(--st-text-color, #fafafa); font: inherit; padding: 6px 8px; }
+td input:focus { outline: none; border-color: #cc0000; background: #222; }
+td input[type=number] { -moz-appearance: textfield; }
+td input::-webkit-inner-spin-button { -webkit-appearance: none; }
+td.del { width: 1%; }
+button { background: transparent; color: #d1d1d1; border: none; cursor: pointer; font: inherit; padding: 6px 10px; }
+td.del button:hover { color: #ff4b4b; }
+.ed-add { margin-top: 6px; border: 1px solid #333; border-radius: 4px; }
+.ed-add:hover { background: #222; color: white; }
+"""
+
+_TABLE_EDITOR_JS = """
+export default function(component) {
+    const { data, setStateValue, parentElement } = component;
+    let root = parentElement.querySelector('.ed-root');
+    if (!root) {
+        root = document.createElement('div');
+        root.className = 'ed-root';
+        parentElement.appendChild(root);
+    }
+    // Même version du fichier : on garde le tableau (et les modifications non sauvegardées).
+    if (root.dataset.version === data.version) return;
+    root.dataset.version = data.version;
+
+    const cols = data.columns, numeric = data.numeric;
+    const rows = data.rows.map(r => r.slice());
+    // Largeur minimale de chaque colonne selon sa valeur la plus longue.
+    const widths = cols.map((c, j) => Math.max(1,
+        ...rows.map(r => r[j] === null || r[j] === undefined ? 0 : String(r[j]).length)) + 2);
+    const push = () => setStateValue('rows', { version: data.version, rows: rows });
+
+    function render() {
+        root.replaceChildren();
+        const wrap = document.createElement('div');
+        wrap.className = 'ed-wrap';
+        const table = document.createElement('table');
+        const head = table.createTHead().insertRow();
+        cols.forEach(c => { const th = document.createElement('th'); th.textContent = c; head.appendChild(th); });
+        head.appendChild(document.createElement('th'));
+        const body = table.createTBody();
+        rows.forEach((row, i) => {
+            const tr = body.insertRow();
+            cols.forEach((c, j) => {
+                const input = document.createElement('input');
+                input.type = numeric[j] ? 'number' : 'text';
+                if (numeric[j]) input.step = 'any';
+                input.style.minWidth = widths[j] + 'ch';
+                input.value = row[j] === null || row[j] === undefined ? '' : row[j];
+                input.addEventListener('change', () => {
+                    const v = input.value.trim();
+                    row[j] = v === '' ? null : (numeric[j] ? Number(v) : v);
+                    push();
+                });
+                tr.insertCell().appendChild(input);
+            });
+            const del = document.createElement('button');
+            del.textContent = '✕';
+            del.title = 'Supprimer la ligne';
+            del.addEventListener('click', () => { rows.splice(i, 1); render(); push(); });
+            const td = tr.insertCell();
+            td.className = 'del';
+            td.appendChild(del);
+        });
+        wrap.appendChild(table);
+        root.appendChild(wrap);
+
+        const add = document.createElement('button');
+        add.className = 'ed-add';
+        add.textContent = '+ Ajouter une ligne';
+        add.addEventListener('click', () => {
+            const row = cols.map(() => null);
+            const idCol = cols.indexOf('ID');
+            if (idCol >= 0) row[idCol] = rows.reduce((m, r) => Math.max(m, Number(r[idCol]) || 0), 0) + 1;
+            rows.push(row);
+            render();
+            push();
+            wrap.scrollTop = wrap.scrollHeight;
+        });
+        root.appendChild(add);
+    }
+
+    render();
+}
+"""
+
+_table_editor = st.components.v2.component(
+    "soremade_table_editor",
+    css=_TABLE_EDITOR_CSS,
+    js=_TABLE_EDITOR_JS,
+)
+
+def table_editor(df, key):
+    """Affiche df dans un tableau éditable et retourne le DataFrame modifié."""
+    split = json.loads(df.to_json(orient="split", index=False))
+    version = hashlib.md5(df.to_csv(index=False).encode()).hexdigest()
+    numeric = [bool(pd.api.types.is_numeric_dtype(df[c])) for c in df.columns]
+    # Modifications non sauvegardées faites sur cette version du fichier (sinon : le fichier).
+    state = st.session_state.get(key, {}).get("rows")
+    rows = state["rows"] if state and state.get("version") == version else split["data"]
+    _table_editor(
+        key=key,
+        data={"columns": split["columns"], "rows": rows, "numeric": numeric, "version": version},
+        on_rows_change=lambda: None,
     )
+
+    edited = pd.DataFrame(rows, columns=df.columns)
+    edited = edited.dropna(how="all")
+    for c, is_num in zip(df.columns, numeric):
+        if is_num:
+            edited[c] = pd.to_numeric(edited[c], errors="coerce")
+            if pd.api.types.is_integer_dtype(df[c]):
+                edited[c] = edited[c].round().astype("Int64")
+    return edited
 
 def load_data(): return pd.read_csv(FILE_DATA)
 def load_players(): return sorted(pd.read_csv(FILE_PLAYERS)["Nom"].tolist())
@@ -965,30 +1071,15 @@ elif curr == "Données":
         st.stop()
     st.title("Base de Données")
     df = load_data()
-    st.markdown(html_table(df), unsafe_allow_html=True)
-
-    csv_text = df.to_csv(index=False)
+    edited = table_editor(df, key="donnees_editor")
     st.markdown(
-        f'<a href="data:text/csv;charset=utf-8,{quote(csv_text)}" download="{FILE_DATA}">⬇️ Télécharger le CSV</a>',
+        f'<a href="data:text/csv;charset=utf-8,{quote(df.to_csv(index=False))}" download="{FILE_DATA}">⬇️ Télécharger le CSV</a>',
         unsafe_allow_html=True,
     )
-
-    st.write("---")
-    st.subheader("Modifier les données")
-    st.caption("Une ligne par entrée, valeurs séparées par des virgules. Gardez la première ligne (en-têtes) telle quelle.")
-    edited_text = st.text_area("CSV", value=csv_text, height=400, label_visibility="collapsed")
     if st.button("Sauvegarder les modifications"):
-        try:
-            edited = pd.read_csv(io.StringIO(edited_text))
-        except Exception as e:
-            st.error(f"CSV invalide : {e}")
-        else:
-            if list(edited.columns) != list(df.columns):
-                st.error(f"Les colonnes doivent rester : {', '.join(df.columns)}")
-            else:
-                edited.to_csv(FILE_DATA, index=False)
-                st.session_state.data_saved = True
-                st.rerun()
+        edited.to_csv(FILE_DATA, index=False)
+        st.session_state.data_saved = True
+        st.rerun()
     if st.session_state.pop("data_saved", False):
         st.success("Sauvegardé !")
 
