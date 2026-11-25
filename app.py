@@ -294,6 +294,28 @@ def table_editor(df, key):
     return edited
 
 def load_data(): return pd.read_csv(FILE_DATA)
+
+# Colonnes qui doivent toujours être remplies (VictoireJour peut rester vide :
+# elle n'est renseignée que pour la dernière partie d'une session).
+REQUIRED_COLS = ["ID", "Date", "Joueur", "Points", "VictoirePartie", "NbJoueurs"]
+REQUIRED_INT_COLS = ["ID", "Points", "VictoirePartie", "NbJoueurs"]
+
+def incomplete_rows(df):
+    """Lignes avec une cellule obligatoire vide ou un nombre invalide."""
+    bad = df[REQUIRED_COLS].isna().any(axis=1)
+    for c in REQUIRED_INT_COLS:
+        bad |= pd.to_numeric(df[c], errors="coerce").isna()
+    return df[bad]
+
+def load_stats_data():
+    """Données pour les pages de statistiques : ignore les lignes incomplètes
+    (sinon les int() sur NbJoueurs, Points… plantent). La page Données, elle,
+    affiche tout pour pouvoir les corriger."""
+    df = load_data()
+    df = df.drop(incomplete_rows(df).index)
+    for c in REQUIRED_INT_COLS:
+        df[c] = pd.to_numeric(df[c]).astype(int)
+    return df
 def load_players(): return sorted(pd.read_csv(FILE_PLAYERS)["Nom"].tolist())
 
 def load_players_df():
@@ -525,7 +547,7 @@ rank_icons = ['🥇', '🥈', '🥉', '🔹', '🔹', '🔹']
 # PAGE : DERNIÈRE SESSION
 # ============================================================
 if curr == "Session":
-    df = load_data()
+    df = load_stats_data()
     st.title("Sessions")
 
     if not df.empty:
@@ -703,7 +725,7 @@ if curr == "Session":
 # PAGE : STATISTIQUES
 # ============================================================
 elif curr == "Statistiques":
-    df = load_data()
+    df = load_stats_data()
     st.title("Scores")
 
     if not df.empty:
@@ -925,7 +947,7 @@ elif curr == "Statistiques":
 # PAGE : PROFIL JOUEUR
 # ============================================================
 elif curr == "Profil":
-    df = load_data()
+    df = load_stats_data()
     player = st.session_state.get("selected_player")
 
     if not player or df.empty:
@@ -1123,9 +1145,19 @@ elif curr == "Données":
         unsafe_allow_html=True,
     )
     if st.button("Sauvegarder les modifications"):
-        edited.to_csv(FILE_DATA, index=False)
-        st.session_state.data_saved = True
-        st.rerun()
+        bad = incomplete_rows(edited)
+        if not bad.empty:
+            ids = ", ".join("?" if pd.isna(i) else f"{i:g}"
+                            for i in pd.to_numeric(bad["ID"], errors="coerce"))
+            st.error(
+                f"Non sauvegardé : ligne(s) incomplète(s) (ID : {ids}). "
+                f"Seule VictoireJour peut rester vide, et {', '.join(REQUIRED_INT_COLS)} "
+                f"doivent être des nombres."
+            )
+        else:
+            edited.to_csv(FILE_DATA, index=False)
+            st.session_state.data_saved = True
+            st.rerun()
     if st.session_state.pop("data_saved", False):
         st.success("Sauvegardé !")
 
