@@ -131,6 +131,8 @@ table { width: 100%; border-collapse: collapse; font-size: 14px; }
 th { position: sticky; top: 0; z-index: 1; background: #1a1a1a; color: #d1d1d1;
      text-align: left; padding: 6px 8px; border-bottom: 1px solid #444; font-weight: 600;
      overflow-wrap: anywhere; }
+th.sortable { cursor: pointer; user-select: none; }
+th.sortable:hover { color: white; background: #222; }
 td { border-bottom: 1px solid #2a2a2a; padding: 0; }
 td input { width: 100%; box-sizing: border-box; background: transparent; border: 1px solid transparent;
            color: var(--st-text-color, #fafafa); font: inherit; padding: 6px 8px; }
@@ -164,16 +166,51 @@ export default function(component) {
         ...rows.map(r => r[j] === null || r[j] === undefined ? 0 : String(r[j]).length)) + 2);
     const push = () => setStateValue('rows', { version: data.version, rows: rows });
 
+    // Tri à l'affichage seulement (le CSV garde son ordre), comme st.data_editor.
+    // Clic sur un en-tête : croissant → décroissant → ordre du fichier.
+    // Le tri choisi est gardé quand le tableau se recharge (après une sauvegarde).
+    let sortCol = root.sortCol ?? null, sortDir = root.sortDir ?? 1;
+    if (sortCol !== null && sortCol >= cols.length) sortCol = null;
+    const added = new Set();  // lignes ajoutées : restent en bas, là où on les saisit
+    const isEmpty = v => v === null || v === undefined || v === '';
+    function compare(a, b, j) {
+        if (isEmpty(a[j]) || isEmpty(b[j])) return isEmpty(a[j]) - isEmpty(b[j]);  // vides à la fin
+        const d = numeric[j] ? a[j] - b[j]
+            : String(a[j]).localeCompare(String(b[j]), 'fr', { numeric: true, sensitivity: 'base' });
+        return d * sortDir;
+    }
+    function displayed() {
+        const base = rows.filter(r => !added.has(r));
+        if (sortCol !== null) base.sort((a, b) => compare(a, b, sortCol));
+        return base.concat(rows.filter(r => added.has(r)));
+    }
+
     function render() {
         root.replaceChildren();
         const wrap = document.createElement('div');
         wrap.className = 'ed-wrap';
         const table = document.createElement('table');
         const head = table.createTHead().insertRow();
-        cols.forEach(c => { const th = document.createElement('th'); th.textContent = c; head.appendChild(th); });
+        cols.forEach((c, j) => {
+            const th = document.createElement('th');
+            th.className = 'sortable';
+            th.title = 'Trier';
+            th.textContent = c + (sortCol === j ? (sortDir === 1 ? ' ▲' : ' ▼') : '');
+            th.addEventListener('click', () => {
+                if (sortCol !== j) { sortCol = j; sortDir = 1; }
+                else if (sortDir === 1) { sortDir = -1; }
+                else { sortCol = null; }
+                root.sortCol = sortCol;
+                root.sortDir = sortDir;
+                const scroll = wrap.scrollTop;
+                render();
+                root.querySelector('.ed-wrap').scrollTop = scroll;
+            });
+            head.appendChild(th);
+        });
         head.appendChild(document.createElement('th'));
         const body = table.createTBody();
-        rows.forEach((row, i) => {
+        displayed().forEach(row => {
             const tr = body.insertRow();
             cols.forEach((c, j) => {
                 const input = document.createElement('input');
@@ -191,7 +228,14 @@ export default function(component) {
             const del = document.createElement('button');
             del.textContent = '✕';
             del.title = 'Supprimer la ligne';
-            del.addEventListener('click', () => { rows.splice(i, 1); render(); push(); });
+            del.addEventListener('click', () => {
+                rows.splice(rows.indexOf(row), 1);
+                added.delete(row);
+                const scroll = wrap.scrollTop;
+                render();
+                root.querySelector('.ed-wrap').scrollTop = scroll;
+                push();
+            });
             const td = tr.insertCell();
             td.className = 'del';
             td.appendChild(del);
@@ -207,9 +251,11 @@ export default function(component) {
             const idCol = cols.indexOf('ID');
             if (idCol >= 0) row[idCol] = rows.reduce((m, r) => Math.max(m, Number(r[idCol]) || 0), 0) + 1;
             rows.push(row);
+            added.add(row);
             render();
             push();
-            wrap.scrollTop = wrap.scrollHeight;
+            const w = root.querySelector('.ed-wrap');
+            w.scrollTop = w.scrollHeight;
         });
         root.appendChild(add);
     }
