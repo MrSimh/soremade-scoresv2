@@ -1,6 +1,15 @@
+import sys
+# pyarrow plante sur le processeur du serveur (Intel Atom N2800, sans SSE4.2).
+# On l'empêche d'être chargé : sans cette ligne, pandas l'importe tout seul.
+# Le graphique et la page Données n'en ont plus besoin (voir points_chart, table_editor).
+sys.modules.setdefault("pyarrow", None)
+
+import hashlib
+import json
 import streamlit as st
 import pandas as pd
 import os
+from urllib.parse import quote
 
 # --- 1. CONFIGURATION ET CSS ---
 st.set_page_config(page_title="Soremade Tracker", layout="wide", initial_sidebar_state="expanded")
@@ -73,6 +82,217 @@ def init_files():
         pd.DataFrame({"Nom": ["Simon", "Cyprien", "Jérémy", "Alexandre"], "Pays": ["fr", "fr", "fr", "fr"]}).to_csv(FILE_PLAYERS, index=False)
 
 init_files()
+
+# --- AFFICHAGE SANS PYARROW ---
+# st.line_chart et st.data_editor passent par pyarrow : on les remplace par du HTML/SVG.
+
+def points_chart(values, color="#cc0000", width=700, height=260):
+    """Courbe SVG des points par partie (remplace st.line_chart)."""
+    values = [float(v) for v in values if pd.notna(v)]
+    if not values:
+        return "<p>Aucune donnée.</p>"
+    pad_l, pad_r, pad_t, pad_b = 45, 15, 15, 30
+    w, h = width - pad_l - pad_r, height - pad_t - pad_b
+    vmin, vmax = min(values), max(values)
+    if vmin == vmax:
+        vmin, vmax = vmin - 1, vmax + 1
+    n = len(values)
+
+    def x(i):
+        return pad_l + (w * i / (n - 1) if n > 1 else w / 2)
+
+    def y(v):
+        return pad_t + h - (v - vmin) / (vmax - vmin) * h
+
+    parts = [f'<svg viewBox="0 0 {width} {height}" width="100%" '
+             f'style="max-width:{width}px" xmlns="http://www.w3.org/2000/svg">']
+    # Graduations horizontales
+    for k in range(5):
+        v = vmin + (vmax - vmin) * k / 4
+        yy = y(v)
+        parts.append(f'<line x1="{pad_l}" y1="{yy:.1f}" x2="{pad_l + w}" y2="{yy:.1f}" stroke="#444" stroke-width="0.5"/>')
+        parts.append(f'<text x="{pad_l - 6}" y="{yy + 4:.1f}" fill="#aaa" font-size="13" text-anchor="end">{v:g}</text>')
+    # Numéros de partie (axe X), au plus ~10 étiquettes
+    step = max(1, round(n / 10))
+    for i in range(0, n, step):
+        parts.append(f'<text x="{x(i):.1f}" y="{height - 8}" fill="#aaa" font-size="13" text-anchor="middle">{i + 1}</text>')
+    pts = " ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in enumerate(values))
+    parts.append(f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="2"/>')
+    for i, v in enumerate(values):
+        parts.append(f'<circle cx="{x(i):.1f}" cy="{y(v):.1f}" r="3" fill="{color}"><title>Partie {i + 1} : {v:g} pts</title></circle>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+# Tableau éditable (remplace st.data_editor). Composant Streamlit v2 en HTML/JS :
+# les données circulent en JSON (listes), jamais en DataFrame, donc sans pyarrow.
+_TABLE_EDITOR_CSS = """
+.ed-wrap { max-height: 500px; overflow: auto; border: 1px solid #333; }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th { position: sticky; top: 0; z-index: 1; background: #1a1a1a; color: #d1d1d1;
+     text-align: left; padding: 6px 8px; border-bottom: 1px solid #444; font-weight: 600;
+     overflow-wrap: anywhere; }
+th.sortable { cursor: pointer; user-select: none; }
+th.sortable:hover { color: white; background: #222; }
+td { border-bottom: 1px solid #2a2a2a; padding: 0; }
+td input { width: 100%; box-sizing: border-box; background: transparent; border: 1px solid transparent;
+           color: var(--st-text-color, #fafafa); font: inherit; padding: 6px 8px; }
+td input:focus { outline: none; border-color: #cc0000; background: #222; }
+td input[type=number] { -moz-appearance: textfield; }
+td input::-webkit-inner-spin-button { -webkit-appearance: none; }
+td.del { width: 1%; }
+button { background: transparent; color: #d1d1d1; border: none; cursor: pointer; font: inherit; padding: 6px 10px; }
+td.del button:hover { color: #ff4b4b; }
+.ed-add { margin-top: 6px; border: 1px solid #333; border-radius: 4px; }
+.ed-add:hover { background: #222; color: white; }
+"""
+
+_TABLE_EDITOR_JS = """
+export default function(component) {
+    const { data, setStateValue, parentElement } = component;
+    let root = parentElement.querySelector('.ed-root');
+    if (!root) {
+        root = document.createElement('div');
+        root.className = 'ed-root';
+        parentElement.appendChild(root);
+    }
+    // Même version du fichier : on garde le tableau (et les modifications non sauvegardées).
+    if (root.dataset.version === data.version) return;
+    root.dataset.version = data.version;
+
+    const cols = data.columns, numeric = data.numeric;
+    const rows = data.rows.map(r => r.slice());
+    // Largeur minimale de chaque colonne selon sa valeur la plus longue.
+    const widths = cols.map((c, j) => Math.max(1,
+        ...rows.map(r => r[j] === null || r[j] === undefined ? 0 : String(r[j]).length)) + 2);
+    const push = () => setStateValue('rows', { version: data.version, rows: rows });
+
+    // Tri à l'affichage seulement (le CSV garde son ordre), comme st.data_editor.
+    // Clic sur un en-tête : croissant → décroissant → ordre du fichier.
+    // Le tri choisi est gardé quand le tableau se recharge (après une sauvegarde).
+    let sortCol = root.sortCol ?? null, sortDir = root.sortDir ?? 1;
+    if (sortCol !== null && sortCol >= cols.length) sortCol = null;
+    const added = new Set();  // lignes ajoutées : restent en bas, là où on les saisit
+    const isEmpty = v => v === null || v === undefined || v === '';
+    function compare(a, b, j) {
+        if (isEmpty(a[j]) || isEmpty(b[j])) return isEmpty(a[j]) - isEmpty(b[j]);  // vides à la fin
+        const d = numeric[j] ? a[j] - b[j]
+            : String(a[j]).localeCompare(String(b[j]), 'fr', { numeric: true, sensitivity: 'base' });
+        return d * sortDir;
+    }
+    function displayed() {
+        const base = rows.filter(r => !added.has(r));
+        if (sortCol !== null) base.sort((a, b) => compare(a, b, sortCol));
+        return base.concat(rows.filter(r => added.has(r)));
+    }
+
+    function render() {
+        root.replaceChildren();
+        const wrap = document.createElement('div');
+        wrap.className = 'ed-wrap';
+        const table = document.createElement('table');
+        const head = table.createTHead().insertRow();
+        cols.forEach((c, j) => {
+            const th = document.createElement('th');
+            th.className = 'sortable';
+            th.title = 'Trier';
+            th.textContent = c + (sortCol === j ? (sortDir === 1 ? ' ▲' : ' ▼') : '');
+            th.addEventListener('click', () => {
+                if (sortCol !== j) { sortCol = j; sortDir = 1; }
+                else if (sortDir === 1) { sortDir = -1; }
+                else { sortCol = null; }
+                root.sortCol = sortCol;
+                root.sortDir = sortDir;
+                const scroll = wrap.scrollTop;
+                render();
+                root.querySelector('.ed-wrap').scrollTop = scroll;
+            });
+            head.appendChild(th);
+        });
+        head.appendChild(document.createElement('th'));
+        const body = table.createTBody();
+        displayed().forEach(row => {
+            const tr = body.insertRow();
+            cols.forEach((c, j) => {
+                const input = document.createElement('input');
+                input.type = numeric[j] ? 'number' : 'text';
+                if (numeric[j]) input.step = 'any';
+                input.style.minWidth = widths[j] + 'ch';
+                input.value = row[j] === null || row[j] === undefined ? '' : row[j];
+                input.addEventListener('change', () => {
+                    const v = input.value.trim();
+                    row[j] = v === '' ? null : (numeric[j] ? Number(v) : v);
+                    push();
+                });
+                tr.insertCell().appendChild(input);
+            });
+            const del = document.createElement('button');
+            del.textContent = '✕';
+            del.title = 'Supprimer la ligne';
+            del.addEventListener('click', () => {
+                rows.splice(rows.indexOf(row), 1);
+                added.delete(row);
+                const scroll = wrap.scrollTop;
+                render();
+                root.querySelector('.ed-wrap').scrollTop = scroll;
+                push();
+            });
+            const td = tr.insertCell();
+            td.className = 'del';
+            td.appendChild(del);
+        });
+        wrap.appendChild(table);
+        root.appendChild(wrap);
+
+        const add = document.createElement('button');
+        add.className = 'ed-add';
+        add.textContent = '+ Ajouter une ligne';
+        add.addEventListener('click', () => {
+            const row = cols.map(() => null);
+            const idCol = cols.indexOf('ID');
+            if (idCol >= 0) row[idCol] = rows.reduce((m, r) => Math.max(m, Number(r[idCol]) || 0), 0) + 1;
+            rows.push(row);
+            added.add(row);
+            render();
+            push();
+            const w = root.querySelector('.ed-wrap');
+            w.scrollTop = w.scrollHeight;
+        });
+        root.appendChild(add);
+    }
+
+    render();
+}
+"""
+
+_table_editor = st.components.v2.component(
+    "soremade_table_editor",
+    css=_TABLE_EDITOR_CSS,
+    js=_TABLE_EDITOR_JS,
+)
+
+def table_editor(df, key):
+    """Affiche df dans un tableau éditable et retourne le DataFrame modifié."""
+    split = json.loads(df.to_json(orient="split", index=False))
+    version = hashlib.md5(df.to_csv(index=False).encode()).hexdigest()
+    numeric = [bool(pd.api.types.is_numeric_dtype(df[c])) for c in df.columns]
+    # Modifications non sauvegardées faites sur cette version du fichier (sinon : le fichier).
+    state = st.session_state.get(key, {}).get("rows")
+    rows = state["rows"] if state and state.get("version") == version else split["data"]
+    _table_editor(
+        key=key,
+        data={"columns": split["columns"], "rows": rows, "numeric": numeric, "version": version},
+        on_rows_change=lambda: None,
+    )
+
+    edited = pd.DataFrame(rows, columns=df.columns)
+    edited = edited.dropna(how="all")
+    for c, is_num in zip(df.columns, numeric):
+        if is_num:
+            edited[c] = pd.to_numeric(edited[c], errors="coerce")
+            if pd.api.types.is_integer_dtype(df[c]):
+                edited[c] = edited[c].round().astype("Int64")
+    return edited
+
 def load_data(): return pd.read_csv(FILE_DATA)
 def load_players(): return sorted(pd.read_csv(FILE_PLAYERS)["Nom"].tolist())
 
@@ -836,8 +1056,7 @@ elif curr == "Profil":
 
             # Courbe 1 : Score par partie (valeur brute)
             st.markdown("**Points par partie**")
-            chart_pts = player_sorted[["Partie_N", "Points"]].set_index("Partie_N")
-            st.line_chart(chart_pts, color="#cc0000")
+            st.markdown(points_chart(player_sorted["Points"], color="#cc0000"), unsafe_allow_html=True)
 
 # ============================================================
 # PAGE : SAISIE
@@ -898,9 +1117,16 @@ elif curr == "Données":
         st.stop()
     st.title("Base de Données")
     df = load_data()
-    edited = st.data_editor(df, num_rows="dynamic", use_container_width=True)
+    edited = table_editor(df, key="donnees_editor")
+    st.markdown(
+        f'<a href="data:text/csv;charset=utf-8,{quote(df.to_csv(index=False))}" download="{FILE_DATA}">⬇️ Télécharger le CSV</a>',
+        unsafe_allow_html=True,
+    )
     if st.button("Sauvegarder les modifications"):
         edited.to_csv(FILE_DATA, index=False)
+        st.session_state.data_saved = True
+        st.rerun()
+    if st.session_state.pop("data_saved", False):
         st.success("Sauvegardé !")
 
 # ============================================================
