@@ -29,6 +29,10 @@ STREAMLIT_SERVER_HEADLESS=true streamlit run app.py
 
 L'application sera accessible sur http://localhost:8501
 
+## Processeurs anciens (Intel Atom N2800…)
+
+`pyarrow` (dépendance de Streamlit et pandas) plante avec « Illegal instruction » sur les processeurs sans SSE4.2. L'application bloque donc son chargement (`sys.modules["pyarrow"] = None` en tête de `app.py`) et n'utilise aucun composant Streamlit qui en dépend : le graphique est dessiné en SVG et la page **Données** utilise un tableau HTML et un éditeur CSV. N'utilisez pas `st.dataframe`, `st.data_editor`, `st.table` ni `st.*_chart` dans de futures modifications.
+
 ## Mot de passe
 
 Les pages **Saisie**, **Données** et **Joueurs** sont protégées par un mot de passe.

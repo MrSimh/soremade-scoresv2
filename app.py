@@ -1,6 +1,15 @@
+import sys
+# pyarrow plante sur le processeur du serveur (Intel Atom N2800, sans SSE4.2).
+# On l'empêche d'être chargé : sans cette ligne, pandas l'importe tout seul.
+# Le graphique et la page Données n'en ont plus besoin (voir points_chart, html_table).
+sys.modules.setdefault("pyarrow", None)
+
+import io
 import streamlit as st
 import pandas as pd
 import os
+from urllib.parse import quote
+from html import escape as html_escape
 
 # --- 1. CONFIGURATION ET CSS ---
 st.set_page_config(page_title="Soremade Tracker", layout="wide", initial_sidebar_state="expanded")
@@ -73,6 +82,65 @@ def init_files():
         pd.DataFrame({"Nom": ["Simon", "Cyprien", "Jérémy", "Alexandre"], "Pays": ["fr", "fr", "fr", "fr"]}).to_csv(FILE_PLAYERS, index=False)
 
 init_files()
+
+# --- AFFICHAGE SANS PYARROW ---
+# st.line_chart et st.data_editor passent par pyarrow : on les remplace par du HTML/SVG.
+
+def points_chart(values, color="#cc0000", width=700, height=260):
+    """Courbe SVG des points par partie (remplace st.line_chart)."""
+    values = [float(v) for v in values if pd.notna(v)]
+    if not values:
+        return "<p>Aucune donnée.</p>"
+    pad_l, pad_r, pad_t, pad_b = 45, 15, 15, 30
+    w, h = width - pad_l - pad_r, height - pad_t - pad_b
+    vmin, vmax = min(values), max(values)
+    if vmin == vmax:
+        vmin, vmax = vmin - 1, vmax + 1
+    n = len(values)
+
+    def x(i):
+        return pad_l + (w * i / (n - 1) if n > 1 else w / 2)
+
+    def y(v):
+        return pad_t + h - (v - vmin) / (vmax - vmin) * h
+
+    parts = [f'<svg viewBox="0 0 {width} {height}" width="100%" '
+             f'style="max-width:{width}px" xmlns="http://www.w3.org/2000/svg">']
+    # Graduations horizontales
+    for k in range(5):
+        v = vmin + (vmax - vmin) * k / 4
+        yy = y(v)
+        parts.append(f'<line x1="{pad_l}" y1="{yy:.1f}" x2="{pad_l + w}" y2="{yy:.1f}" stroke="#444" stroke-width="0.5"/>')
+        parts.append(f'<text x="{pad_l - 6}" y="{yy + 4:.1f}" fill="#aaa" font-size="13" text-anchor="end">{v:g}</text>')
+    # Numéros de partie (axe X), au plus ~10 étiquettes
+    step = max(1, round(n / 10))
+    for i in range(0, n, step):
+        parts.append(f'<text x="{x(i):.1f}" y="{height - 8}" fill="#aaa" font-size="13" text-anchor="middle">{i + 1}</text>')
+    pts = " ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in enumerate(values))
+    parts.append(f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="2"/>')
+    for i, v in enumerate(values):
+        parts.append(f'<circle cx="{x(i):.1f}" cy="{y(v):.1f}" r="3" fill="{color}"><title>Partie {i + 1} : {v:g} pts</title></circle>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+def html_table(df):
+    """Tableau HTML en lecture seule (remplace st.dataframe / st.data_editor)."""
+    def cell(v):
+        if pd.isna(v):
+            return ""
+        if isinstance(v, float) and v.is_integer():
+            v = int(v)
+        return html_escape(str(v))
+    head = "".join(f"<th>{html_escape(str(c))}</th>" for c in df.columns)
+    rows = "".join("<tr>" + "".join(f"<td>{cell(v)}</td>" for v in row) + "</tr>"
+                   for row in df.itertuples(index=False))
+    return (
+        '<div style="max-height:450px;overflow:auto;border:1px solid #333">'
+        '<table style="width:100%;border-collapse:collapse;font-size:14px">'
+        f'<thead style="position:sticky;top:0;background:#1a1a1a"><tr>{head}</tr></thead>'
+        f"<tbody>{rows}</tbody></table></div>"
+    )
+
 def load_data(): return pd.read_csv(FILE_DATA)
 def load_players(): return sorted(pd.read_csv(FILE_PLAYERS)["Nom"].tolist())
 
@@ -836,8 +904,7 @@ elif curr == "Profil":
 
             # Courbe 1 : Score par partie (valeur brute)
             st.markdown("**Points par partie**")
-            chart_pts = player_sorted[["Partie_N", "Points"]].set_index("Partie_N")
-            st.line_chart(chart_pts, color="#cc0000")
+            st.markdown(points_chart(player_sorted["Points"], color="#cc0000"), unsafe_allow_html=True)
 
 # ============================================================
 # PAGE : SAISIE
@@ -898,9 +965,31 @@ elif curr == "Données":
         st.stop()
     st.title("Base de Données")
     df = load_data()
-    edited = st.data_editor(df, num_rows="dynamic", use_container_width=True)
+    st.markdown(html_table(df), unsafe_allow_html=True)
+
+    csv_text = df.to_csv(index=False)
+    st.markdown(
+        f'<a href="data:text/csv;charset=utf-8,{quote(csv_text)}" download="{FILE_DATA}">⬇️ Télécharger le CSV</a>',
+        unsafe_allow_html=True,
+    )
+
+    st.write("---")
+    st.subheader("Modifier les données")
+    st.caption("Une ligne par entrée, valeurs séparées par des virgules. Gardez la première ligne (en-têtes) telle quelle.")
+    edited_text = st.text_area("CSV", value=csv_text, height=400, label_visibility="collapsed")
     if st.button("Sauvegarder les modifications"):
-        edited.to_csv(FILE_DATA, index=False)
+        try:
+            edited = pd.read_csv(io.StringIO(edited_text))
+        except Exception as e:
+            st.error(f"CSV invalide : {e}")
+        else:
+            if list(edited.columns) != list(df.columns):
+                st.error(f"Les colonnes doivent rester : {', '.join(df.columns)}")
+            else:
+                edited.to_csv(FILE_DATA, index=False)
+                st.session_state.data_saved = True
+                st.rerun()
+    if st.session_state.pop("data_saved", False):
         st.success("Sauvegardé !")
 
 # ============================================================
