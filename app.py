@@ -1,6 +1,9 @@
 import streamlit as st
 import pandas as pd
 import os
+from datetime import date, timedelta
+from urllib.parse import quote
+from html import escape as html_escape
 
 # --- 1. CONFIGURATION ET CSS ---
 st.set_page_config(page_title="Soremade Tracker", layout="wide", initial_sidebar_state="expanded")
@@ -63,34 +66,84 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # --- 2. GESTION DES FICHIERS ---
+# Le CSV de données est la seule source de vérité : aucune donnée n'est écrite en dur dans le code.
 FILE_DATA = "data_soremade.csv"
 FILE_PLAYERS = "players_soremade.csv"
+PLAYER_COLUMNS = ["Nom", "Pays", "Actif", "Titre"]
 
 def init_files():
     if not os.path.exists(FILE_DATA):
         pd.DataFrame(columns=["ID", "Date", "Joueur", "Points", "VictoirePartie", "VictoireJour", "NbJoueurs"]).to_csv(FILE_DATA, index=False)
     if not os.path.exists(FILE_PLAYERS):
-        pd.DataFrame({"Nom": ["Simon", "Cyprien", "Jérémy", "Alexandre"], "Pays": ["fr", "fr", "fr", "fr"]}).to_csv(FILE_PLAYERS, index=False)
+        pd.DataFrame(columns=PLAYER_COLUMNS).to_csv(FILE_PLAYERS, index=False)
 
 init_files()
 def load_data(): return pd.read_csv(FILE_DATA)
-def load_players(): return sorted(pd.read_csv(FILE_PLAYERS)["Nom"].tolist())
 
 def load_players_df():
-    """Charge le CSV joueurs complet (Nom + Pays)."""
+    """Charge le CSV joueurs complet (Nom, Pays, Actif, Titre). Les colonnes manquantes sont complétées."""
     df = pd.read_csv(FILE_PLAYERS)
+    if "Nom" not in df.columns:
+        df["Nom"] = pd.Series(dtype=str)
+    df = df.dropna(subset=["Nom"]).copy()
     if "Pays" not in df.columns:
         df["Pays"] = "fr"
-    return df
+    if "Actif" not in df.columns:
+        df["Actif"] = 1
+    if "Titre" not in df.columns:
+        df["Titre"] = ""
+    df["Pays"] = df["Pays"].fillna("fr").astype(str).str.strip().str.lower()
+    df["Actif"] = pd.to_numeric(df["Actif"], errors="coerce").fillna(1).astype(int)
+    df["Titre"] = df["Titre"].fillna("").astype(str)
+    return df[PLAYER_COLUMNS].reset_index(drop=True)
+
+def load_players(active_only=True):
+    """Liste triée des noms de joueurs (par défaut : uniquement les joueurs actifs)."""
+    df = load_players_df()
+    if active_only:
+        df = df[df["Actif"] == 1]
+    return sorted(df["Nom"].tolist())
+
+def inactive_players():
+    """Ensemble des joueurs désactivés."""
+    df = load_players_df()
+    return set(df[df["Actif"] == 0]["Nom"].tolist())
+
+def get_players_info():
+    """
+    Dict {nom: {Pays, Actif, Titre}}. Fusionne le CSV joueurs et les noms présents
+    dans le CSV de données (un joueur absent du CSV joueurs est considéré actif).
+    """
+    info = {r.Nom: {"Pays": r.Pays, "Actif": r.Actif, "Titre": r.Titre} for r in load_players_df().itertuples()}
+    data = load_data()
+    if "Joueur" in data.columns:
+        for n in data["Joueur"].dropna().unique():
+            info.setdefault(n, {"Pays": "fr", "Actif": 1, "Titre": ""})
+    return info
+
+def update_player(name, **fields):
+    """Met à jour des champs d'un joueur dans le CSV (le crée s'il n'y est pas encore)."""
+    df = load_players_df()
+    if name not in df["Nom"].values:
+        df = pd.concat([df, pd.DataFrame([{"Nom": name, "Pays": "fr", "Actif": 1, "Titre": ""}])], ignore_index=True)
+    for k, v in fields.items():
+        df.loc[df["Nom"] == name, k] = v
+    df.sort_values("Nom").to_csv(FILE_PLAYERS, index=False)
 
 def get_player_country(player_name):
     """Retourne le code pays d'un joueur (ex: 'fr')."""
     df = load_players_df()
     row = df[df["Nom"] == player_name]
     if not row.empty:
-        val = row.iloc[0]["Pays"]
-        return str(val).strip().lower() if pd.notna(val) else "fr"
+        val = str(row.iloc[0]["Pays"]).strip().lower()
+        return val if val else "fr"
     return "fr"
+
+def get_player_title(player_name):
+    """Retourne le titre spécial d'un joueur (texte libre du CSV), ou ''."""
+    df = load_players_df()
+    row = df[df["Nom"] == player_name]
+    return row.iloc[0]["Titre"].strip() if not row.empty else ""
 
 def country_flag(code):
     """Convertit un code pays ISO 3166-1 alpha-2 en emoji drapeau."""
@@ -98,6 +151,64 @@ def country_flag(code):
     if len(code) != 2:
         return ""
     return chr(0x1F1E6 + ord(code[0]) - ord('A')) + chr(0x1F1E6 + ord(code[1]) - ord('A'))
+
+def filter_active(df_input):
+    """Retire les joueurs désactivés d'un DataFrame de scores."""
+    inactive = inactive_players()
+    if not inactive or df_input.empty:
+        return df_input
+    return df_input[~df_input["Joueur"].isin(inactive)]
+
+# --- Saisons ---
+# Saisons météorologiques : Hiver (déc-fév), Printemps (mars-mai), Été (juin-août), Automne (sept-nov).
+# Décembre appartient à l'hiver de l'année suivante (ex : déc 2025 -> Hiver 2026).
+# Une saison est identifiée par un entier : année * 4 + rang (0=Hiver ... 3=Automne), triable chronologiquement.
+SEASON_NAMES = ["Hiver", "Printemps", "Été", "Automne"]
+
+def season_of(d):
+    """Identifiant de saison d'une date."""
+    m, y = d.month, d.year
+    if m == 12:
+        return (y + 1) * 4
+    if m in (1, 2):
+        return y * 4
+    if m in (3, 4, 5):
+        return y * 4 + 1
+    if m in (6, 7, 8):
+        return y * 4 + 2
+    return y * 4 + 3
+
+def season_label(sid):
+    """Ex : 'Été 2026'."""
+    sid = int(sid)
+    return f"{SEASON_NAMES[sid % 4]} {sid // 4}"
+
+def season_dates(sid):
+    """(début, fin) d'une saison. Hiver N = 1er déc N-1 -> dernier jour de fév N."""
+    sid = int(sid)
+    y, r = sid // 4, sid % 4
+    if r == 0:
+        return date(y - 1, 12, 1), date(y, 3, 1) - timedelta(days=1)
+    if r == 1:
+        return date(y, 3, 1), date(y, 5, 31)
+    if r == 2:
+        return date(y, 6, 1), date(y, 8, 31)
+    return date(y, 9, 1), date(y, 11, 30)
+
+def season_period(sid):
+    """Ex : 'du 01/06/2026 au 31/08/2026'."""
+    start, end = season_dates(sid)
+    return start.strftime("du %d/%m/%Y") + end.strftime(" au %d/%m/%Y")
+
+def current_season():
+    return season_of(date.today())
+
+def with_season(df_input):
+    """Ajoute une colonne temporaire '_season' (lignes sans date valide ignorées). À retirer avant toute sauvegarde."""
+    dates = pd.to_datetime(df_input["Date"], errors="coerce")
+    df_out = df_input[dates.notna()].copy()
+    df_out["_season"] = [season_of(d) for d in dates[dates.notna()]]
+    return df_out
 
 def calc_victoire_jour_stats(df_input):
     """Calcule le taux de victoire jour par joueur."""
@@ -113,24 +224,36 @@ def calc_champion(df_input):
     Calcule le classement général 'Champion du Monde'.
     Système de points : 1er = 3pts, 2ème = 2pts, 3ème = 1pt
     sur les 3 classements (Moyenne Points, Victoires Parties, Victoires Sessions).
-    Départage : le plus de 1ères places, puis le plus de 2èmes places.
-    Retourne une liste de tuples (joueur, score, nb_1er, nb_2eme, nb_3eme).
+    Égalité de points : on compte les médailles d'or, puis d'argent, puis de bronze.
+    Si l'égalité persiste : score normalisé (moyenne de 3 notes de 0 à 1, calculées avec
+    les écarts réels entre le pire et le meilleur de chaque tableau).
+    Retourne une liste de tuples (joueur, score, nb_1er, nb_2eme, nb_3eme, score_normalisé).
     """
     if df_input.empty:
         return []
 
     points_attrib = {0: 3, 1: 2, 2: 1}  # index 0 = 1er place = 3 pts
 
-    # Classement 1 : Moyenne de points (ascending, lower is better)
     rank_pts = df_input.groupby("Joueur")["Points"].mean().sort_values()
-    # Classement 2 : Taux victoires parties (descending)
     rank_vp = df_input.groupby("Joueur")["VictoirePartie"].mean().sort_values(ascending=False)
-    # Classement 3 : Taux victoires Sessions (descending)
     rank_vj = calc_victoire_jour_stats(df_input)
+
+    def normalize(series, lower_is_better):
+        """Note de 0 (pire du tableau) à 1 (meilleur du tableau)."""
+        if series.empty:
+            return {}
+        lo, hi = float(series.min()), float(series.max())
+        if hi == lo:
+            return {p: 1.0 for p in series.index}
+        if lower_is_better:
+            return {p: (hi - float(v)) / (hi - lo) for p, v in series.items()}
+        return {p: (float(v) - lo) / (hi - lo) for p, v in series.items()}
+
+    norm_tables = [normalize(rank_pts, True), normalize(rank_vp, False), normalize(rank_vj, False)]
 
     all_players = df_input["Joueur"].unique()
     scores = {p: 0 for p in all_players}
-    positions = {p: [] for p in all_players}  # liste des positions obtenues (0-indexed)
+    positions = {p: [] for p in all_players}
 
     for ranking in [rank_pts, rank_vp, rank_vj]:
         if ranking.empty:
@@ -140,16 +263,18 @@ def calc_champion(df_input):
                 scores[player] += points_attrib[pos]
                 positions[player].append(pos)
 
-    # Construire la liste avec les critères de départage
     result = []
     for player in all_players:
-        nb_1er = positions[player].count(0)
-        nb_2eme = positions[player].count(1)
-        nb_3eme = positions[player].count(2)
-        result.append((player, scores[player], nb_1er, nb_2eme, nb_3eme))
+        # Joueur absent d'un tableau (ex : aucune session terminée) : note 0 pour ce tableau
+        norm_score = sum(t.get(player, 0.0) for t in norm_tables) / 3
+        result.append((
+            player, scores[player],
+            positions[player].count(0), positions[player].count(1), positions[player].count(2),
+            norm_score,
+        ))
 
-    # Tri : score desc, puis nb 1er desc, puis nb 2ème desc
-    result.sort(key=lambda x: (x[1], x[2], x[3]), reverse=True)
+    # Tri : points desc, puis nb d'or, d'argent, de bronze, puis score normalisé (écarts) en dernier recours
+    result.sort(key=lambda x: (x[1], x[2], x[3], x[4], x[5]), reverse=True)
     return result
 
 def count_sessions(df_input):
@@ -191,69 +316,187 @@ def count_total_parties(df_input):
 
 def get_all_champions(df_input):
     """
-    Retourne un dict {joueur: [liste d'années]} des titres de champion du monde.
-    Inclut les champions historiques hardcodés et les champions calculés par année.
+    Retourne ({joueur: [saisons gagnées]}, saison_en_cours).
+    Les saisons sont des identifiants (voir season_of). Le champion de chaque saison est
+    calculé à partir des seules données du CSV. Les joueurs désactivés sont exclus du
+    calcul de la saison en cours ; les saisons passées restent figées (historique conservé).
     """
-    from datetime import date
-    current_year = date.today().year
-
-    # Champions historiques (années sans données)
-    historical_champions = {2025: "Simon"}
-
+    cur = current_season()
     champions = {}
+    if df_input.empty:
+        return champions, cur
 
-    # Ajouter les champions historiques
-    for year, player in historical_champions.items():
-        if player not in champions:
-            champions[player] = []
-        champions[player].append(year)
+    df_s = with_season(df_input)
+    inactive = inactive_players()
+    for sid in sorted(df_s["_season"].unique()):
+        df_season = df_s[df_s["_season"] == sid]
+        if sid == cur:
+            df_season = df_season[~df_season["Joueur"].isin(inactive)]
+        champion_data = calc_champion(df_season)
+        if champion_data:
+            champions.setdefault(champion_data[0][0], []).append(int(sid))
+    return champions, cur
 
-    # Calculer les champions pour chaque année présente dans les données
-    if not df_input.empty:
-        df_input = df_input.copy()
-        df_input["_year"] = pd.to_datetime(df_input["Date"]).dt.year
-        for year in sorted(df_input["_year"].unique()):
-            df_year = df_input[df_input["_year"] == year]
-            champion_data = calc_champion(df_year)
-            if champion_data:
-                winner = champion_data[0][0]
-                if winner not in champions:
-                    champions[winner] = []
-                if year not in champions[winner]:
-                    champions[winner].append(year)
-
-    return champions, current_year
-
-def format_champion_label(years, current_year):
-    """Formate la mention champion du monde pour l'affichage."""
+def format_champion_label(seasons, cur):
+    """Formate la liste des saisons gagnées (la plus récente d'abord), avec leurs dates."""
     labels = []
-    for y in sorted(years):
-        if y == current_year:
-            labels.append("actuel")
-        else:
-            labels.append(str(y))
+    for s in sorted(seasons, reverse=True):
+        label = season_label(s)
+        if s == cur:
+            label += " (actuel)"
+        labels.append(label)
     return ", ".join(labels)
 
 def player_link(name, extra=""):
     """Génère un lien HTML cliquable vers le profil d'un joueur."""
-    return f'<a class="player-link" href="?player={name}" target="_self">{extra}{name}</a>'
+    back = quote(str(st.session_state.get("menu", "Saison")))
+    return f'<a class="player-link" href="?player={quote(str(name))}&back={back}" target="_self">{extra}{name}</a>'
+
+def render_scores(df, df_raw):
+    """
+    Affiche records, totaux, classements et détails par configuration.
+    df     : scores des joueurs actifs (classements, records, moyennes)
+    df_raw : mêmes données sans filtre joueurs (le comptage des parties/sessions
+             repose sur des blocs de lignes consécutives, qu'un filtre casserait)
+    """
+    if df.empty:
+        st.info("Aucune donnée pour le moment.")
+        return
+
+    # --- RECORDS & MOYENNES ---
+    st.subheader("Records & Moyennes")
+
+    idx_max = df["Points"].idxmax()
+    max_pts = df.loc[idx_max, "Points"]
+    max_rows = df[df["Points"] == max_pts]
+    max_joueur = max_rows.iloc[-1]["Joueur"]
+
+    idx_min = df["Points"].idxmin()
+    min_pts = df.loc[idx_min, "Points"]
+    min_rows = df[df["Points"] == min_pts]
+    min_joueur = min_rows.iloc[-1]["Joueur"]
+
+    col_min, col_max = st.columns(2)
+    with col_min:
+        st.metric("🔻 Score min sur une partie", f"{min_pts} pts", f"par {min_joueur}")
+    with col_max:
+        st.metric("🔺 Score max sur une partie", f"{max_pts} pts", f"par {max_joueur}")
+
+    st.write("")
+    moy_globale = df["Points"].mean()
+    st.markdown(f"**Moyenne globale des points (toutes parties)** : `{moy_globale:.2f}`")
+
+    nb_joueurs_values = sorted(df["NbJoueurs"].unique())
+    cols_moy = st.columns(len(nb_joueurs_values))
+    for i, n in enumerate(nb_joueurs_values):
+        subset = df[df["NbJoueurs"] == n]
+        moy_n = subset["Points"].mean()
+        with cols_moy[i]:
+            st.metric(f"Moyenne à {int(n)} joueurs", f"{moy_n:.2f} pts")
+
+    st.write("---")
+
+    # --- TOTAUX PARTIES & SESSIONS ---
+    st.subheader("Totaux")
+    total_parties = count_total_parties(df_raw)
+    total_sessions = count_sessions(df_raw)
+    col_tp, col_ts = st.columns(2)
+    with col_tp:
+        st.metric("Nombre total de parties jouées", total_parties)
+    with col_ts:
+        st.metric("Nombre total de sessions jouées", total_sessions)
+
+    st.write("---")
+
+    # --- CLASSEMENT GENERAL avec noms cliquables ---
+    st.subheader("Classement Général")
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        st.markdown("**Moyenne (Points)**")
+        res = df.groupby("Joueur")["Points"].mean().sort_values().head(6)
+        lines = ""
+        for i, (name, val) in enumerate(res.items()):
+            icon = rank_icons[i] if i < len(rank_icons) else f"{i+1}."
+            lines += f"{icon} {player_link(name, '<b>')}{'</b>'} : {val:.3f}<br>"
+        st.markdown(lines, unsafe_allow_html=True)
+
+    with c2:
+        st.markdown("**Victoires (Parties)**")
+        res = df.groupby("Joueur")["VictoirePartie"].mean().sort_values(ascending=False).head(6)
+        lines = ""
+        for i, (name, val) in enumerate(res.items()):
+            icon = rank_icons[i] if i < len(rank_icons) else f"{i+1}."
+            lines += f"{icon} {player_link(name, '<b>')}{'</b>'} : {val*100:.1f}%<br>"
+        st.markdown(lines, unsafe_allow_html=True)
+
+    with c3:
+        st.markdown("**Victoires (Sessions)**")
+        res = calc_victoire_jour_stats(df).head(6)
+        lines = ""
+        for i, (name, val) in enumerate(res.items()):
+            icon = rank_icons[i] if i < len(rank_icons) else f"{i+1}."
+            lines += f"{icon} {player_link(name, '<b>')}{'</b>'} : {val*100:.1f}%<br>"
+        st.markdown(lines, unsafe_allow_html=True)
+
+    st.write("---")
+
+    # --- DETAILS PAR CONFIGURATION ---
+    st.subheader("Détails par configuration")
+    for n in sorted(df["NbJoueurs"].unique()):
+        subset = df[df["NbJoueurs"] == n]
+        if not subset.empty:
+            try:
+                leader_p = subset.groupby("Joueur")["Points"].mean().sort_values().index[0]
+            except: leader_p = "-"
+            try:
+                leader_v = subset.groupby("Joueur")["VictoirePartie"].mean().sort_values(ascending=False).index[0]
+            except: leader_v = "-"
+            try:
+                vj_stats = calc_victoire_jour_stats(subset)
+                leader_j = vj_stats.index[0] if not vj_stats.empty else "-"
+            except: leader_j = "-"
+
+            titre_resume = f"Table de {int(n)} joueurs — 🥇 {leader_p} | 🥇 {leader_v} | 🥇 {leader_j}"
+
+            with st.expander(titre_resume):
+                sc1, sc2, sc3 = st.columns(3)
+
+                sc1.markdown("**Moyenne Pts**")
+                res_p = subset.groupby("Joueur")["Points"].mean().sort_values().head(6)
+                for i, (name, val) in enumerate(res_p.items()):
+                    icon = rank_icons[i] if i < len(rank_icons) else f"{i+1}."
+                    sc1.write(f"{icon} **{name}** : {val:.3f}")
+
+                sc2.markdown("**Parties**")
+                res_v = subset.groupby("Joueur")["VictoirePartie"].mean().sort_values(ascending=False).head(6)
+                for i, (name, val) in enumerate(res_v.items()):
+                    icon = rank_icons[i] if i < len(rank_icons) else f"{i+1}."
+                    sc2.write(f"{icon} **{name}** : {val*100:.1f}%")
+
+                sc3.markdown("**Sessions**")
+                res_j = calc_victoire_jour_stats(subset).head(6)
+                for i, (name, val) in enumerate(res_j.items()):
+                    icon = rank_icons[i] if i < len(rank_icons) else f"{i+1}."
+                    sc3.write(f"{icon} **{name}** : {val*100:.1f}%")
 
 # --- 3. NAVIGATION ---
 # Gestion via query params pour les liens joueur
 qp = st.query_params
 if "player" in qp:
+    st.session_state.back_menu = qp.get("back", "Saison")
     st.session_state.menu = "Profil"
     st.session_state.selected_player = qp["player"]
     st.query_params.clear()
 
 if "menu" not in st.session_state:
-    st.session_state.menu = "Statistiques"
+    st.session_state.menu = "Saison"
 if "selected_player" not in st.session_state:
     st.session_state.selected_player = None
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
-PROTECTED_PAGES = {"Saisie", "Données", "Joueurs"}
+PROTECTED_PAGES = {"Saisie", "Données", "Gestion"}
 
 def check_password():
     """Affiche un formulaire de mot de passe et retourne True si authentifié."""
@@ -277,11 +520,13 @@ with st.sidebar:
 
     lock = "" if st.session_state.authenticated else " 🔒"
     pages = {
-        "Statistiques": "🏆 Statistiques",
+        "Saison": "📅 Saison en cours",
+        "Statistiques": "🏆 Tous les scores",
         "Session": "🎲 Sessions",
+        "ListeJoueurs": "👥 Joueurs",
         "Saisie": f"✍️ Saisie{lock}",
         "Données": f"📊 Données{lock}",
-        "Joueurs": f"👥 Joueurs{lock}"
+        "Gestion": f"⚙️ Gestion joueurs{lock}"
     }
 
     for key, label in pages.items():
@@ -294,7 +539,7 @@ with st.sidebar:
         if st.button("🔓 Se déconnecter"):
             st.session_state.authenticated = False
             if st.session_state.menu in PROTECTED_PAGES:
-                st.session_state.menu = "Statistiques"
+                st.session_state.menu = "Saison"
             st.rerun()
 
 # --- 4. CONTENU ---
@@ -480,238 +725,120 @@ if curr == "Session":
         st.info("Aucune donnée pour le moment.")
 
 # ============================================================
-# PAGE : STATISTIQUES
+# PAGE : SCORES DE LA SAISON EN COURS
+# ============================================================
+elif curr == "Saison":
+    df_raw = load_data()
+    cur_season = current_season()
+    st.title(f"Scores — {season_label(cur_season)}")
+    st.caption("📅 Saison " + season_period(cur_season))
+
+    df_season = with_season(df_raw)
+    df_season = df_season[df_season["_season"] == cur_season].drop(columns="_season")
+
+    if df_season.empty:
+        st.info(f"Aucune partie jouée pour la saison {season_label(cur_season)}.")
+    else:
+        df_active = filter_active(df_season)
+
+        # Champion actuel : affichage discret
+        champion_data = calc_champion(df_active)
+        if champion_data:
+            tie_note = ""
+            if len(champion_data) > 1 and champion_data[0][1] == champion_data[1][1]:
+                a, b = champion_data[0], champion_data[1]
+                if a[2:5] != b[2:5]:
+                    tie_note = (" — égalité à " + str(a[1]) + " pts, départagée aux médailles (or/argent/bronze : "
+                                + str(a[2]) + "/" + str(a[3]) + "/" + str(a[4]) + " contre "
+                                + str(b[2]) + "/" + str(b[3]) + "/" + str(b[4]) + ")")
+                else:
+                    tie_note = (" — égalité à " + str(a[1]) + " pts et en médailles, départagée aux écarts ("
+                                + format(a[5], ".2f") + " contre " + format(b[5], ".2f") + ")")
+            st.markdown(
+                "<div style='color: #888; font-size: 14px; margin-bottom: 10px;'>"
+                "🏆 Champion actuel : <b>" + player_link(champion_data[0][0]) + "</b>" + tie_note + "</div>",
+                unsafe_allow_html=True
+            )
+
+        st.write("---")
+        render_scores(df_active, df_season)
+
+# ============================================================
+# PAGE : TOUS LES SCORES
 # ============================================================
 elif curr == "Statistiques":
     df = load_data()
-    st.title("Scores")
+    st.title("Tous les scores")
+    render_scores(filter_active(df), df)
 
-    if not df.empty:
-       
-        # --- CHAMPION DU MONDE ---
-        # Déterminer les années disponibles
-        df["_year"] = pd.to_datetime(df["Date"]).dt.year
-        available_years = sorted(df["_year"].unique().tolist())
-        # Ajouter 2025 si pas dans les données (champion historique)
-        all_years = sorted(set([2025] + available_years))
+# ============================================================
+# PAGE : LISTE DES JOUEURS (publique)
+# ============================================================
+elif curr == "ListeJoueurs":
+    st.title("Joueurs")
+    df = load_data()
+    info = get_players_info()
+    champions_map, cur_season = get_all_champions(df)
 
-        if "champion_year" not in st.session_state:
-            st.session_state.champion_year = all_years[-1]
-        # S'assurer que l'année est dans les bornes
-        if st.session_state.champion_year not in all_years:
-            st.session_state.champion_year = all_years[-1]
+    show_inactive = st.checkbox("Afficher les joueurs inactifs", value=False)
 
-        selected_year = st.session_state.champion_year
-        year_idx = all_years.index(selected_year)
-        from datetime import date
-        current_year = date.today().year
-        year_label = "actuel" if selected_year == current_year else str(selected_year)
+    entries = []
+    for name, p in info.items():
+        if not p["Actif"] and not show_inactive:
+            continue
+        entries.append((name, p, sorted(champions_map.get(name, []), reverse=True)))
 
-        col_yp, col_yi, col_spacer, col_yn = st.columns([1, 3, 0.7, 0.3])
-        with col_yp:
-            if st.button("←", disabled=(year_idx == 0), key="btn_prev_year"):
-                st.session_state.champion_year = all_years[year_idx - 1]
-                st.rerun()
-        with col_yi:
-            st.markdown(f"<div style='text-align: center; font-size: 20px; font-weight: bold; padding-top: 5px;'>{selected_year}</div>", unsafe_allow_html=True)
-        with col_yn:
-            if st.button("→", disabled=(year_idx == len(all_years) - 1), key="btn_next_year"):
-                st.session_state.champion_year = all_years[year_idx + 1]
-                st.rerun()
-
-        if selected_year == 2025:
-            # Champion historique hardcodé
-            st.markdown(
-                f"<div style='text-align: center; padding: 20px; background: linear-gradient(135deg, #FFD700 0%, #FFA500 100%); "
-                f"border-radius: 12px; margin-bottom: 15px;'>"
-                f"<span style='font-size: 48px;'>🏆</span><br>"
-                f"<span style='font-size: 28px; font-weight: bold; color: #1a1a1a;'>Simon</span><br>"
-                f"<span style='font-size: 14px; color: #333;'>Champion du Monde {year_label}</span>"
-                f"</div>",
-                unsafe_allow_html=True
-            )
-        else:
-            # Filtrer les données de l'année sélectionnée
-            df_year = df[df["_year"] == selected_year]
-            if df_year.empty:
-                st.info(f"Aucune donnée pour {selected_year}.")
-            else:
-                champion_data = calc_champion(df_year)
-                if champion_data:
-                    champion = champion_data[0]
-                    st.markdown(
-                        f"<div style='text-align: center; padding: 20px; background: linear-gradient(135deg, #FFD700 0%, #FFA500 100%); "
-                        f"border-radius: 12px; margin-bottom: 15px;'>"
-                        f"<span style='font-size: 48px;'>🏆</span><br>"
-                        f"<span style='font-size: 28px; font-weight: bold; color: #1a1a1a;'>{champion[0]}</span><br>"
-                        f"<span style='font-size: 14px; color: #333;'>Champion du Monde {year_label}</span>"
-                        f"</div>",
-                        unsafe_allow_html=True
-                    )
-
-                    # Tableau du classement général
-                    # html_champ = '<table style="width:100%; border-collapse: collapse; text-align: center; margin-top: 10px;">'
-                    # html_champ += '<tr style="border-bottom: 2px solid #555;">'
-                    # html_champ += '<th style="padding: 8px;">Rang</th>'
-                    # html_champ += '<th style="padding: 8px;">Joueur</th>'
-                    # html_champ += '<th style="padding: 8px;">Score</th>'
-                    # html_champ += '<th style="padding: 8px;">🥇</th>'
-                    # html_champ += '<th style="padding: 8px;">🥈</th>'
-                    # html_champ += '<th style="padding: 8px;">🥉</th>'
-                    # html_champ += '</tr>'
-                    # for idx_c, (name, score, nb1, nb2, nb3) in enumerate(champion_data):
-                        # icon = rank_icons[idx_c] if idx_c < len(rank_icons) else f"{idx_c+1}."
-                        # bold = 'font-weight: bold;' if idx_c == 0 else ''
-                        # html_champ += f'<tr style="border-bottom: 1px solid #333;">'
-                        # html_champ += f'<td style="padding: 8px;">{icon}</td>'
-                        # html_champ += f'<td style="padding: 8px; {bold}">{player_link(name)}</td>'
-                        # html_champ += f'<td style="padding: 8px; {bold}">{score}</td>'
-                        # html_champ += f'<td style="padding: 8px;">{nb1}</td>'
-                        # html_champ += f'<td style="padding: 8px;">{nb2}</td>'
-                        # html_champ += f'<td style="padding: 8px;">{nb3}</td>'
-                        # html_champ += '</tr>'
-                    # html_champ += '</table>'
-                    # st.markdown(html_champ, unsafe_allow_html=True)
-
-                    # st.caption("Score = 1er: 3pts, 2ème: 2pts, 3ème: 1pt sur chaque classement (Moyenne, Victoires Parties, Victoires Sessions). Départage : plus de 1ères places, puis plus de 2èmes places.")
-
-        # Nettoyer la colonne temporaire
-        df = df.drop(columns=["_year"])
-
-        st.write("---")
-        
- # --- RECORDS & MOYENNES ---
-        st.subheader("Records & Moyennes")
-
-        idx_max = df["Points"].idxmax()
-        max_pts = df.loc[idx_max, "Points"]
-        max_rows = df[df["Points"] == max_pts]
-        max_joueur = max_rows.iloc[-1]["Joueur"]
-
-        idx_min = df["Points"].idxmin()
-        min_pts = df.loc[idx_min, "Points"]
-        min_rows = df[df["Points"] == min_pts]
-        min_joueur = min_rows.iloc[-1]["Joueur"]
-
-        col_min, col_max = st.columns(2)
-        with col_min:
-            st.metric("🔻 Score min sur une partie", f"{min_pts} pts", f"par {min_joueur}")
-        with col_max:
-            st.metric("🔺 Score max sur une partie", f"{max_pts} pts", f"par {max_joueur}")
-
-        st.write("")
-        moy_globale = df["Points"].mean()
-        st.markdown(f"**Moyenne globale des points (toutes parties)** : `{moy_globale:.2f}`")
-
-        nb_joueurs_values = sorted(df["NbJoueurs"].unique())
-        cols_moy = st.columns(len(nb_joueurs_values))
-        for i, n in enumerate(nb_joueurs_values):
-            subset = df[df["NbJoueurs"] == n]
-            moy_n = subset["Points"].mean()
-            with cols_moy[i]:
-                st.metric(f"Moyenne à {int(n)} joueurs", f"{moy_n:.2f} pts")
-
-        st.write("---")
-
-        # --- TOTAUX PARTIES & SESSIONS ---
-        st.subheader("Totaux")
-        total_parties = count_total_parties(df)
-        total_sessions = count_sessions(df)
-        col_tp, col_ts = st.columns(2)
-        with col_tp:
-            st.metric("Nombre total de parties jouées", total_parties)
-        with col_ts:
-            st.metric("Nombre total de sessions jouées", total_sessions)
-        st.caption("Les 1167 parties jouées avant janvier 2026 ne sont pas présentes dans ces statistiques.")
-
-        st.write("---")
-
-        # --- CLASSEMENT GENERAL avec noms cliquables ---
-        st.subheader("Classement Général")
-        c1, c2, c3 = st.columns(3)
-
-        with c1:
-            st.markdown("**Moyenne (Points)**")
-            res = df.groupby("Joueur")["Points"].mean().sort_values().head(6)
-            lines = ""
-            for i, (name, val) in enumerate(res.items()):
-                icon = rank_icons[i] if i < len(rank_icons) else f"{i+1}."
-                lines += f"{icon} {player_link(name, '<b>')}{'</b>'} : {val:.3f}<br>"
-            st.markdown(lines, unsafe_allow_html=True)
-
-        with c2:
-            st.markdown("**Victoires (Parties)**")
-            res = df.groupby("Joueur")["VictoirePartie"].mean().sort_values(ascending=False).head(6)
-            lines = ""
-            for i, (name, val) in enumerate(res.items()):
-                icon = rank_icons[i] if i < len(rank_icons) else f"{i+1}."
-                lines += f"{icon} {player_link(name, '<b>')}{'</b>'} : {val*100:.1f}%<br>"
-            st.markdown(lines, unsafe_allow_html=True)
-
-        with c3:
-            st.markdown("**Victoires (Sessions)**")
-            res = calc_victoire_jour_stats(df).head(6)
-            lines = ""
-            for i, (name, val) in enumerate(res.items()):
-                icon = rank_icons[i] if i < len(rank_icons) else f"{i+1}."
-                lines += f"{icon} {player_link(name, '<b>')}{'</b>'} : {val*100:.1f}%<br>"
-            st.markdown(lines, unsafe_allow_html=True)
-
-        st.write("---")
-
-        # --- DETAILS PAR CONFIGURATION ---
-        st.subheader("Détails par configuration")
-        for n in sorted(df["NbJoueurs"].unique()):
-            subset = df[df["NbJoueurs"] == n]
-            if not subset.empty:
-                try:
-                    leader_p = subset.groupby("Joueur")["Points"].mean().sort_values().index[0]
-                except: leader_p = "-"
-                try:
-                    leader_v = subset.groupby("Joueur")["VictoirePartie"].mean().sort_values(ascending=False).index[0]
-                except: leader_v = "-"
-                try:
-                    vj_stats = calc_victoire_jour_stats(subset)
-                    leader_j = vj_stats.index[0] if not vj_stats.empty else "-"
-                except: leader_j = "-"
-
-                titre_resume = f"Table de {int(n)} joueurs — 🥇 {leader_p} | 🥇 {leader_v} | 🥇 {leader_j}"
-
-                with st.expander(titre_resume):
-                    sc1, sc2, sc3 = st.columns(3)
-
-                    sc1.markdown("**Moyenne Pts**")
-                    res_p = subset.groupby("Joueur")["Points"].mean().sort_values().head(6)
-                    for i, (name, val) in enumerate(res_p.items()):
-                        icon = rank_icons[i] if i < len(rank_icons) else f"{i+1}."
-                        sc1.write(f"{icon} **{name}** : {val:.3f}")
-
-                    sc2.markdown("**Parties**")
-                    res_v = subset.groupby("Joueur")["VictoirePartie"].mean().sort_values(ascending=False).head(6)
-                    for i, (name, val) in enumerate(res_v.items()):
-                        icon = rank_icons[i] if i < len(rank_icons) else f"{i+1}."
-                        sc2.write(f"{icon} **{name}** : {val*100:.1f}%")
-
-                    sc3.markdown("**Sessions**")
-                    res_j = calc_victoire_jour_stats(subset).head(6)
-                    for i, (name, val) in enumerate(res_j.items()):
-                        icon = rank_icons[i] if i < len(rank_icons) else f"{i+1}."
-                        sc3.write(f"{icon} **{name}** : {val*100:.1f}%")
-
+    if not entries:
+        st.info("Aucun joueur enregistré.")
     else:
-        st.info("Aucune donnée pour le moment.")
+        # Classement par nombre de saisons gagnées, puis ordre alphabétique
+        entries.sort(key=lambda e: (-len(e[2]), e[0].lower()))
+
+        html = '<table style="width:100%; border-collapse: collapse;">'
+        html += '<tr style="border-bottom: 2px solid #555; text-align: left;">'
+        html += '<th style="padding: 8px; width: 60px;">Rang</th><th style="padding: 8px;">Joueur</th><th style="padding: 8px;">Titres de champion</th></tr>'
+        for name, p, seasons in entries:
+            n = len(seasons)
+            rank = 1 + sum(1 for e in entries if len(e[2]) > n) if n > 0 else "-"
+            flag = country_flag(p["Pays"])
+            inactif = " <span style='color: #888; font-size: 0.85em;'>(inactif)</span>" if not p["Actif"] else ""
+            titre = f"<br><span style='color: #FFD700; font-size: 0.85em;'>{html_escape(p['Titre'])}</span>" if p["Titre"].strip() else ""
+            if seasons:
+                titres_html = f"🏆 <b>{n}</b> — {format_champion_label(seasons, cur_season)}"
+            else:
+                titres_html = '<span style="color: #888;">—</span>'
+            html += '<tr style="border-bottom: 1px solid #333;">'
+            html += f'<td style="padding: 8px;">{rank}</td>'
+            html += f'<td style="padding: 8px;">{flag} {player_link(name)}{inactif}{titre}</td>'
+            html += f'<td style="padding: 8px;">{titres_html}</td>'
+            html += '</tr>'
+        html += '</table>'
+        st.markdown(html, unsafe_allow_html=True)
+        st.caption(
+            "Classement par nombre de saisons de champion remportées. La saison en cours est provisoire.\n\n"
+            "**Comment se gagne une saison ?** "
+            "Sur la saison, trois classements sont établis : moyenne de points (la plus basse gagne), "
+            "victoires de parties et victoires de sessions. "
+            "Chaque classement rapporte 3 points au 1er, 2 au 2ème et 1 au 3ème. "
+            "Le champion est le joueur qui totalise le plus de points.\n\n"
+            "**En cas d'égalité :** "
+            "1) le plus de médailles d'or (1res places), puis d'argent (2èmes places), puis de bronze (3èmes places) ; "
+            "2) si l'égalité persiste, les écarts : chaque joueur reçoit dans chaque classement une note de 0 (le moins bon) "
+            "à 1 (le meilleur) selon son écart réel avec le meilleur et le pire, et le meilleur score moyen l'emporte."
+        )
 
 # ============================================================
 # PAGE : PROFIL JOUEUR
 # ============================================================
 elif curr == "Profil":
-    df = load_data()
+    df_raw = load_data()
     player = st.session_state.get("selected_player")
 
-    if not player or df.empty:
+    if not player or df_raw.empty:
         st.info("Aucun joueur sélectionné.")
     else:
-        player_df = df[df["Joueur"] == player]
+        df = filter_active(df_raw)  # classements : joueurs actifs uniquement
+        player_df = df_raw[df_raw["Joueur"] == player]
 
         if player_df.empty:
             st.info(f"Aucune donnée pour {player}.")
@@ -720,26 +847,33 @@ elif curr == "Profil":
             st.title(f"{flag} {player}")
 
             
-            champions_map, current_year = get_all_champions(df)
+            champions_map, cur_season = get_all_champions(df_raw)
 
-            # Afficher les titres spéciaux
-            if player == 'Simon' or player == 'Cyprien':
+            if player in inactive_players():
+                st.caption("Joueur inactif : exclu des classements.")
+
+            # Titre spécial (colonne Titre du CSV joueurs)
+            special_title = get_player_title(player)
+            if special_title:
                 st.markdown(
-                    f"<span style='color: #FFD700; font-size: 18px;'>🛠️ Créateur du jeu</span>",
+                    f"<span style='color: #FFD700; font-size: 18px;'>{html_escape(special_title)}</span>",
                     unsafe_allow_html=True
                 )
 
-            # Afficher le badge champion du monde si applicable
+            # Titres de champion du monde par saison
             if player in champions_map:
-                label = format_champion_label(champions_map[player], current_year)
+                label = format_champion_label(champions_map[player], cur_season)
                 st.markdown(
-                    f"<span style='color: #FFD700; font-size: 18px;'>🏆 Champion du Monde {label}</span>",
+                    f"<span style='color: #FFD700; font-size: 18px;'>🏆 Champion du Monde : {label}</span>",
                     unsafe_allow_html=True
                 )
 
             # Bouton retour
-            if st.button("← Retour aux Statistiques"):
-                st.session_state.menu = "Statistiques"
+            back_menu = st.session_state.get("back_menu", "Saison")
+            if back_menu in PROTECTED_PAGES or back_menu == "Profil":
+                back_menu = "Saison"
+            if st.button("← Retour"):
+                st.session_state.menu = back_menu
                 st.rerun()
 
             # --- STATS PRINCIPALES ---
@@ -904,37 +1038,46 @@ elif curr == "Données":
         st.success("Sauvegardé !")
 
 # ============================================================
-# PAGE : JOUEURS
+# PAGE : GESTION DES JOUEURS
 # ============================================================
-elif curr == "Joueurs":
+elif curr == "Gestion":
     if not check_password():
         st.stop()
     st.title("Gestion des Joueurs")
 
-    players = load_players()
+    info = get_players_info()
+    names = sorted(info.keys())
     players_df = load_players_df()
     df_data = load_data()
 
     if "confirm_delete" not in st.session_state:
         st.session_state.confirm_delete = None
 
-    st.subheader("Joueurs existants")
+    def set_active(name):
+        update_player(name, Actif=int(st.session_state[f"act_{name}"]))
 
-    if players:
-        for p in players:
-            col1, col2 = st.columns([5, 1])
+    st.subheader("Joueurs existants")
+    st.caption("Un joueur désactivé n'apparaît plus dans les scores ni dans la saisie. Ses données sont conservées.")
+
+    if names:
+        for p in names:
+            col1, col2, col3 = st.columns([4, 2, 1])
 
             with col1:
-                flag = country_flag(get_player_country(p))
-                st.markdown(f"{flag} {player_link(p)}", unsafe_allow_html=True)
+                flag = country_flag(info[p]["Pays"])
+                inactif = " <span style='color: #888;'>(inactif)</span>" if not info[p]["Actif"] else ""
+                st.markdown(f"{flag} {player_link(p)}{inactif}", unsafe_allow_html=True)
 
             with col2:
+                st.toggle("Actif", value=bool(info[p]["Actif"]), key=f"act_{p}", on_change=set_active, args=(p,))
+
+            with col3:
                 if st.button("🗑", key=f"del_{p}", help="Supprimer ce joueur"):
                     st.session_state.confirm_delete = p
 
         if st.session_state.confirm_delete:
             player_to_delete = st.session_state.confirm_delete
-            st.warning(f"⚠️ Supprimer définitivement **{player_to_delete}** ?")
+            st.warning(f"⚠️ Supprimer définitivement **{player_to_delete}** et toutes ses données ?")
 
             c1, c2 = st.columns(2)
             with c1:
@@ -950,6 +1093,14 @@ elif curr == "Joueurs":
                 if st.button("❌ Annuler"):
                     st.session_state.confirm_delete = None
                     st.rerun()
+
+        with st.expander("Titre spécial d'un joueur"):
+            sel = st.selectbox("Joueur", names, key="titre_sel")
+            new_title = st.text_input("Titre affiché (ex : 🛠️ Créateur du jeu, vide pour retirer)", value=info[sel]["Titre"], key=f"titre_{sel}")
+            if st.button("Enregistrer le titre"):
+                update_player(sel, Titre=new_title.strip())
+                st.success("Titre enregistré.")
+                st.rerun()
     else:
         st.info("Aucun joueur enregistré.")
 
@@ -964,10 +1115,10 @@ elif curr == "Joueurs":
         clean_country = new_country.strip().lower() if new_country.strip() else "fr"
         if not clean_new:
             st.warning("Nom invalide.")
-        elif clean_new.lower() in [p.lower() for p in players]:
+        elif clean_new.lower() in [p.lower() for p in names]:
             st.error("Ce joueur existe déjà.")
         else:
-            new_row = pd.DataFrame({"Nom": [clean_new], "Pays": [clean_country]})
+            new_row = pd.DataFrame({"Nom": [clean_new], "Pays": [clean_country], "Actif": [1], "Titre": [""]})
             players_df = pd.concat([players_df, new_row], ignore_index=True).sort_values("Nom")
             players_df.to_csv(FILE_PLAYERS, index=False)
             st.success(f"{clean_new} ajouté.")
